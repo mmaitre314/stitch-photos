@@ -94,39 +94,161 @@ def _chain_homographies(n, pairs, ref):
     return to_ref
 
 
-def _bundle_adjust(n, pairs, to_ref, ref):
+def _detect_grid_lines(images, min_len=100, sample_step=40, tol_deg=15):
     """
-    Jointly refine every image's homography-to-reference by minimizing
-    reprojection error across all confident pairwise matches at once
-    (not just the chain used for the initial guess), which spreads out
-    the drift that would otherwise accumulate frame-to-frame.
+    Detect the long near-horizontal and near-vertical line segments in each
+    image — the family-tree connector rails, page edges, table borders, etc.
+    A flat document is full of these, and because they are truly horizontal
+    or vertical on the page, they're what lets the alignment lock the whole
+    grid straight (see `_bundle_adjust`). Each segment is returned as a list
+    of sampled points along it.
     """
-    others = [i for i in range(n) if i in to_ref and i != ref]
+    lsd = cv2.createLineSegmentDetector()
+    h_segs, v_segs = [], []
+    for img in images:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        detected = lsd.detect(gray)[0]
+        hs, vs = [], []
+        if detected is not None:
+            for x1, y1, x2, y2 in detected.reshape(-1, 4):
+                length = np.hypot(x2 - x1, y2 - y1)
+                if length < min_len:
+                    continue
+                angle = ((np.degrees(np.arctan2(y2 - y1, x2 - x1)) + 90) % 180) - 90
+                t = np.linspace(0, 1, max(2, int(length / sample_step)))
+                pts = np.stack([x1 + (x2 - x1) * t, y1 + (y2 - y1) * t], 1)
+                if abs(angle) < tol_deg:
+                    hs.append(pts)
+                elif abs(angle) > 90 - tol_deg:
+                    vs.append(pts)
+        h_segs.append(hs)
+        v_segs.append(vs)
+    return h_segs, v_segs
+
+
+def _rectify_reference(h_segs, v_segs, shape, min_lines=8):
+    """
+    Build a homography that makes the reference panel fronto-parallel, by
+    sending its horizontal and vertical line families to the image axes
+    (i.e. their vanishing points to infinity). Holding this panel fixed
+    during bundle adjustment both removes its own perspective from the
+    mosaic and pins the scale, so the line constraints can't collapse the
+    result. Returns None if the panel lacks the line structure to do this
+    reliably, in which case stitching falls back to a feature-only fit.
+    """
+    if len(h_segs) < min_lines or len(v_segs) < min_lines:
+        return None
+
+    def vanishing_point(segs):
+        ends = [(s[0], s[-1]) for s in segs]
+        lengths = np.array([np.hypot(*(b - a)) for a, b in ends])
+        coords = np.array([np.cross([a[0], a[1], 1.0], [b[0], b[1], 1.0]) for a, b in ends])
+        coords /= np.linalg.norm(coords[:, :2], axis=1, keepdims=True)
+        weights = lengths.copy()
+        for _ in range(5):
+            _, _, vt = np.linalg.svd((coords * weights[:, None]).T @ coords)
+            vp = vt[-1]
+            resid = np.abs(coords @ vp)
+            weights = lengths / (1 + (resid / (np.median(resid) + 1e-9)) ** 2)
+        return vp
+
+    vp_h = vanishing_point(h_segs)
+    vp_v = vanishing_point(v_segs)
+
+    # Send the vanishing line (horizon through both vanishing points) to
+    # infinity, which restores parallelism.
+    horizon = np.cross(vp_h, vp_v)
+    if abs(horizon[2]) < 1e-12:
+        return None
+    horizon = horizon / horizon[2]
+    proj = np.array([[1, 0, 0], [0, 1, 0], [horizon[0], horizon[1], 1.0]])
+
+    # Then an affine correction that maps the (now finite) line directions
+    # onto the x and y axes, so horizontal lines run horizontal and vertical
+    # lines run vertical with a right angle between them.
+    d_h = proj @ vp_h
+    d_h = d_h[:2] / np.linalg.norm(d_h[:2])
+    d_v = proj @ vp_v
+    d_v = d_v[:2] / np.linalg.norm(d_v[:2])
+    if d_h[0] < 0:
+        d_h = -d_h  # keep the horizontal axis pointing right
+    if d_v[1] < 0:
+        d_v = -d_v  # keep the vertical axis pointing down
+    affine = np.linalg.inv(np.column_stack([d_h, d_v]))
+    rect = np.array([[affine[0, 0], affine[0, 1], 0],
+                     [affine[1, 0], affine[1, 1], 0],
+                     [0, 0, 1.0]]) @ proj
+
+    # Normalize so the panel keeps its resolution (unit area scale at its
+    # center), otherwise rectification can silently shrink the mosaic.
+    h, w = shape[:2]
+    center = rect @ [w / 2, h / 2, 1]
+    center /= center[2]
+    jac_x = rect @ [w / 2 + 1, h / 2, 1]
+    jac_x /= jac_x[2]
+    jac_y = rect @ [w / 2, h / 2 + 1, 1]
+    jac_y /= jac_y[2]
+    area = abs((jac_x[0] - center[0]) * (jac_y[1] - center[1]) -
+               (jac_x[1] - center[1]) * (jac_y[0] - center[0]))
+    return np.diag([1 / np.sqrt(area), 1 / np.sqrt(area), 1.0]) @ rect
+
+
+def _bundle_adjust(n, pairs, base_homographies, ref, rectify, h_segs, v_segs,
+                   line_weight=0.7, anchor_weight=0.01):
+    """
+    Jointly refine every panel's homography so that it both (a) matches
+    features across the overlaps and (b) keeps each panel's detected
+    horizontal lines level and vertical lines plumb.
+
+    Feature matches alone leave the mosaic wavy: the matched points sit in a
+    narrow horizontal band (the photos), so the rows are free to drift up
+    and down from panel to panel. The line terms remove exactly that freedom
+    and straighten the grid across seams.
+
+    When a fronto-parallel `rectify` for the reference panel is available it
+    is held fixed; features then tie the other panels to its scale while the
+    line terms flatten everything. Without it (too few lines) this degrades
+    to a feature-only fit with the reference held at identity.
+    """
+    use_lines = rectify is not None
+    ref_H = rectify if use_lines else np.eye(3)
+    others = [i for i in range(n) if i != ref]
     index = {i: k for k, i in enumerate(others)}
 
     def pack(Hs):
         return np.concatenate([(Hs[i] / Hs[i][2, 2]).flatten()[:8] for i in others])
 
     def unpack(p):
-        Hs = {ref: np.eye(3)}
+        Hs = [None] * n
+        Hs[ref] = ref_H
         for i in others:
-            h = p[index[i] * 8:index[i] * 8 + 8]
-            Hs[i] = np.array([*h[:8], 1.0]).reshape(3, 3)
+            Hs[i] = np.array([*p[index[i] * 8:index[i] * 8 + 8], 1.0]).reshape(3, 3)
         return Hs
 
     def apply_h(H, pts):
         proj = np.hstack([pts, np.ones((len(pts), 1))]) @ H.T
         return proj[:, :2] / proj[:, 2:3]
 
+    p_init = pack(base_homographies)
+
     def residuals(p):
         Hs = unpack(p)
-        res = [apply_h(Hs[i], src) - apply_h(Hs[j], dst)
-               for (i, j), (_, src, dst) in pairs.items()
-               if i in Hs and j in Hs]
-        return np.concatenate([r.ravel() for r in res])
+        res = [(apply_h(Hs[i], src) - apply_h(Hs[j], dst)).ravel()
+               for (i, j), (_, src, dst) in pairs.items()]
+        if use_lines:
+            for k in range(n):
+                for seg in h_segs[k]:
+                    warped = apply_h(Hs[k], seg)
+                    res.append(line_weight * (warped[1:, 1] - warped[0, 1]))
+                for seg in v_segs[k]:
+                    warped = apply_h(Hs[k], seg)
+                    res.append(line_weight * (warped[1:, 0] - warped[0, 0]))
+            # Soft anchor to the initial guess pins the leftover translation
+            # gauge and keeps the optimization stable.
+            res.append(anchor_weight * (p - p_init))
+        return np.concatenate(res)
 
-    p0 = pack(to_ref)
-    result = least_squares(residuals, p0, method="lm", max_nfev=200)
+    result = least_squares(residuals, p_init, method="lm", max_nfev=100)
     return unpack(result.x)
 
 
@@ -134,8 +256,8 @@ def _warp_and_blend(images, homographies):
     """Warp each image into the shared reference frame and feather-blend
     the overlaps by distance to each image's own edge."""
     all_corners = []
-    for img, H in homographies.items():
-        h, w = images[img].shape[:2]
+    for img, H in zip(images, homographies):
+        h, w = img.shape[:2]
         corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
         proj = np.hstack([corners, np.ones((4, 1))]) @ H.T
         all_corners.append(proj[:, :2] / proj[:, 2:3])
@@ -147,8 +269,7 @@ def _warp_and_blend(images, homographies):
 
     acc = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
     weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
-    for img_idx, H in homographies.items():
-        img = images[img_idx]
+    for img, H in zip(images, homographies):
         H = translate @ H
         warped = cv2.warpPerspective(img, H, (canvas_w, canvas_h),
                                      flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
@@ -177,9 +298,17 @@ def stitch(images, paths):
             "Make sure adjacent photos overlap by 30-40%."
         )
 
-    ref = kept[len(kept) // 2]
+    h_segs, v_segs = _detect_grid_lines(images)
+    # Anchor on the panel with the strongest grid in both directions, so
+    # rectifying it to fronto-parallel is well-conditioned.
+    ref = max(kept, key=lambda i: min(len(h_segs[i]), len(v_segs[i])))
+    rectify = _rectify_reference(h_segs[ref], v_segs[ref], images[ref].shape)
+
+    base = rectify if rectify is not None else np.eye(3)
     to_ref = _chain_homographies(n, pairs, ref)
-    homographies = _bundle_adjust(n, pairs, to_ref, ref)
+    base_homographies = [base @ to_ref[i] for i in range(n)]
+    homographies = _bundle_adjust(n, pairs, base_homographies, ref, rectify,
+                                  h_segs, v_segs)
     return _warp_and_blend(images, homographies)
 
 
