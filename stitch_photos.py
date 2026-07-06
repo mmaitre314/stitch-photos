@@ -252,36 +252,82 @@ def _bundle_adjust(n, pairs, base_homographies, ref, rectify, h_segs, v_segs,
     return unpack(result.x)
 
 
-def _warp_and_blend(images, homographies):
-    """Warp each image into the shared reference frame and feather-blend
-    the overlaps by distance to each image's own edge."""
+def _warp_and_blend(images, homographies, seam_scale=0.25, num_bands=5):
+    """
+    Warp each image into the shared frame, then composite with content-aware
+    seams instead of averaging the overlaps.
+
+    Feather (distance-weighted) blending mixes every overlapping pixel from
+    all covering photos, so any residual misalignment a homography can't
+    model — chiefly lens distortion, worst near frame edges — shows up as
+    ghosting/blur on content in the overlaps. Instead a seam finder routes
+    the boundary between photos through low-detail regions (the blank page),
+    so each headshot is taken whole from a single photo; only a narrow
+    multi-band transition is blended to hide the seam. Per-image exposure
+    gains even out brightness so the seams don't show.
+    """
+    # Canvas bounds from all warped corners.
     all_corners = []
     for img, H in zip(images, homographies):
         h, w = img.shape[:2]
         corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
         proj = np.hstack([corners, np.ones((4, 1))]) @ H.T
         all_corners.append(proj[:, :2] / proj[:, 2:3])
-    all_corners = np.vstack(all_corners)
-    min_xy = np.floor(all_corners.min(axis=0)).astype(int)
-    max_xy = np.ceil(all_corners.max(axis=0)).astype(int)
-    canvas_w, canvas_h = (max_xy - min_xy)
-    translate = np.array([[1, 0, -min_xy[0]], [0, 1, -min_xy[1]], [0, 0, 1]])
+    stacked = np.vstack(all_corners)
+    min_xy = np.floor(stacked.min(axis=0)).astype(int)
+    max_xy = np.ceil(stacked.max(axis=0)).astype(int)
+    canvas_w, canvas_h = int(max_xy[0] - min_xy[0]), int(max_xy[1] - min_xy[1])
+    translate = np.array([[1, 0, -min_xy[0]], [0, 1, -min_xy[1]], [0, 0, 1.0]])
 
-    acc = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
-    weight = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+    # Warp each image (and its coverage mask) into its own tight sub-rect of
+    # the canvas, to keep the seam finder and blender memory-light.
+    corners, warped, masks = [], [], []
     for img, H in zip(images, homographies):
+        h, w = img.shape[:2]
         H = translate @ H
-        warped = cv2.warpPerspective(img, H, (canvas_w, canvas_h),
-                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        mask = np.full(img.shape[:2], 255, np.uint8)
-        warped_mask = cv2.warpPerspective(mask, H, (canvas_w, canvas_h),
-                                          flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
-        dist = cv2.distanceTransform(warped_mask, cv2.DIST_L2, 5)
-        acc += warped.astype(np.float32) * dist[..., None]
-        weight += dist
+        proj = np.hstack([np.float32([[0, 0], [w, 0], [w, h], [0, h]]),
+                          np.ones((4, 1))]) @ H.T
+        proj = proj[:, :2] / proj[:, 2:3]
+        lo = np.floor(proj.min(axis=0)).astype(int)
+        hi = np.ceil(proj.max(axis=0)).astype(int)
+        x0, y0 = max(0, lo[0]), max(0, lo[1])
+        x1, y1 = min(canvas_w, hi[0]), min(canvas_h, hi[1])
+        offset = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1.0]]) @ H
+        warped.append(cv2.warpPerspective(img, offset, (x1 - x0, y1 - y0),
+                                          flags=cv2.INTER_LINEAR))
+        masks.append(cv2.warpPerspective(np.full((h, w), 255, np.uint8), offset,
+                                         (x1 - x0, y1 - y0), flags=cv2.INTER_NEAREST))
+        corners.append((int(x0), int(y0)))
 
-    weight[weight == 0] = 1
-    return np.clip(acc / weight[..., None], 0, 255).astype(np.uint8)
+    # Even out per-image brightness so the seams are invisible.
+    compensator = cv2.detail.ExposureCompensator_createDefault(
+        cv2.detail.ExposureCompensator_GAIN)
+    compensator.feed(corners, warped, masks)
+    for i in range(len(images)):
+        compensator.apply(i, corners[i], warped[i], masks[i])
+
+    # Find seams on downscaled copies (fast; the boundary is smooth anyway).
+    small_imgs = [cv2.resize(w_, (max(1, int(w_.shape[1] * seam_scale)),
+                                  max(1, int(w_.shape[0] * seam_scale)))).astype(np.float32)
+                  for w_ in warped]
+    small_masks = [cv2.resize(m, (max(1, int(m.shape[1] * seam_scale)),
+                                  max(1, int(m.shape[0] * seam_scale))),
+                              interpolation=cv2.INTER_NEAREST) for m in masks]
+    small_corners = [(int(x * seam_scale), int(y * seam_scale)) for x, y in corners]
+    seam_masks = cv2.detail_DpSeamFinder("COLOR_GRAD").find(
+        small_imgs, small_corners, small_masks)
+    seam_masks = [m.get() if hasattr(m, "get") else m for m in seam_masks]
+
+    # Multi-band blend across the narrow seam transitions at full resolution.
+    blender = cv2.detail_MultiBandBlender(0, num_bands)
+    blender.prepare((0, 0, canvas_w, canvas_h))
+    for i in range(len(images)):
+        seam = cv2.resize(seam_masks[i], (masks[i].shape[1], masks[i].shape[0]),
+                          interpolation=cv2.INTER_LINEAR)
+        seam = cv2.bitwise_and(seam, masks[i])
+        blender.feed(warped[i].astype(np.int16), seam, corners[i])
+    result, _ = blender.blend(None, None)
+    return cv2.convertScaleAbs(result)
 
 
 def stitch(images, paths):
